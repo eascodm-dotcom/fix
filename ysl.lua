@@ -39,6 +39,7 @@ local WeaveHitSet
 local KillAuraSet
 local ApplySensitivity
 local ApplyAllConfig
+local RunDoctor
 
 -- =========================== LOAD OBSIDIAN ==================================
 local Library
@@ -412,18 +413,22 @@ local CFG = Tabs.Misc:AddLeftGroupbox("Configs")
 local cfgNames = listConfigs()
 local cfgValues = (#cfgNames > 0) and cfgNames or { "(none)" }
 local typedName = ""
+SelectedConfig = cfgNames[1]
 
 local cfgDropdown
 cfgDropdown = CFG:AddDropdown("cfg_list", {
     Text = "Saved Config",
     Values = cfgValues,
-    Default = cfgValues[1],
     Callback = function(v)
         if v and v ~= "(none)" then SelectedConfig = v end
     end,
 })
+if cfgDropdown and cfgDropdown.SetValue then
+    pcall(function() cfgDropdown:SetValue(cfgValues[1]) end)
+end
 
-CFG:AddTextbox("cfg_name", {
+-- Obsidian has no AddTextbox; the text input is AddInput.
+Options.cfg_name = CFG:AddInput("cfg_name", {
     Text = "Config Name",
     Placeholder = "type a name",
     Default = "",
@@ -433,13 +438,18 @@ CFG:AddTextbox("cfg_name", {
 local function refreshDropdown()
     local names = listConfigs()
     if #names == 0 then names = { "(none)" } end
-    if cfgDropdown and cfgDropdown.Refresh then
-        pcall(function() cfgDropdown:Refresh(names) end)
+    if cfgDropdown and cfgDropdown.SetValues then
+        pcall(function() cfgDropdown:SetValues(names) end)
+    elseif cfgDropdown and cfgDropdown.RefreshPool then
+        pcall(function() cfgDropdown:RefreshPool() end)
     end
 end
 
 local function notify(msg)
-    if Library and Library.Notify then pcall(function() Library:Notify(msg) end) end
+    if not (Library and Library.Notify) then return end
+    pcall(function()
+        Library:Notify({ Title = "YSL", Description = tostring(msg), Time = 3 })
+    end)
 end
 
 CFG:AddButton({ Text = "Save", Func = function()
@@ -488,6 +498,10 @@ end })
 CFG2:AddButton({ Text = "Clear Autoload", Func = function()
     if typeof(delfile) == "function" then pcall(delfile, AUTOLOAD_FILE) end
     notify("Autoload cleared")
+end })
+
+CFG2:AddButton({ Text = "Run Doctor", Func = function()
+    if RunDoctor then RunDoctor() else notify("Features never loaded - check console") end
 end })
 
 -- =========================== FEATURE CODE ==================================
@@ -707,6 +721,14 @@ end
 
 -- =========================== COMBAT ========================================
 
+-- Attack sequence: the real one when AttackState resolved, otherwise a local
+-- counter. Sending a constant 0 gets rejected by servers that track sequence.
+local function currentSeq()
+    if AttackState and AttackState.Active then return Active.Seq end
+    Active.Seq = (Active.Seq or 0) + 1
+    return Active.Seq
+end
+
 local function reportOnce(seq, target)
     if not Combat or not Combat.HitReport then return false end
     if not target or not target.root or not target.root:IsA("BasePart") then return false end
@@ -763,6 +785,23 @@ local function silentHitMulti(seq, targets)
     end
 end
 
+-- Fallback attack trigger: if the game's HitWindow never resolves, M1/touch
+-- still drives hitbox and silent hits.
+local function attackTrigger()
+    if not (Config.hitbox.enabled or Config.damage.autoConnect) then return end
+    if not Combat or not Combat.HitReport then return end
+                        local seq = currentSeq()
+    local targets = collect(Config.damage.autoConnect and Config.damage.connectRange or Config.hitbox.radius)
+    if #targets == 0 then return end
+    task.delay(0.02, function()
+        local hitT = {}
+        for _, t in ipairs(targets) do
+            if t.dist <= HITBOX_MAX and reportOnce(seq, t) then table.insert(hitT, t) end
+        end
+        if #hitT > 0 then silentHitMulti(seq, hitT) end
+    end)
+end
+
 local function hookCombat()
     if not HitWindow or not origHWStart then return end
     HitWindow.Start = function(kind, limb, track, group)
@@ -776,7 +815,7 @@ local function hookCombat()
             Active.OpenFrame = true; Active.CanAttack = true
         end
         if not suppressHookReport and (Config.hitbox.enabled or Config.damage.autoConnect) then
-            local seq = Active.Seq
+                                local seq = currentSeq()
             local targets = collect(Config.damage.autoConnect and Config.damage.connectRange or Config.hitbox.radius)
             if #targets > 0 then
                 task.delay(0.02, function()
@@ -831,7 +870,7 @@ WeaveHitSet = function(on)
             if Config.weaveHit.enabled and weaveActiveNow() and Combat and Combat.HitReport then
                 local targets = collect(Config.hitbox.radius)
                 if #targets > 0 then
-                    local seq = Active.Seq
+                    local seq = currentSeq()
                     weaveBypass(function()
                         for _, t in ipairs(targets) do
                             if dealing(t) then reportOnce(seq, t) break end
@@ -861,7 +900,7 @@ KillAuraSet = function(on)
                 local targets = collect(Config.killaura.radius)
                 local n = math.min(#targets, math.floor(Config.killaura.maxTargets or 1))
                 if n > 0 then
-                    local seq = Active.Seq
+                    local seq = currentSeq()
                     local function hitAll()
                         for i = 1, n do
                             local t = targets[i]
@@ -908,7 +947,7 @@ local function setupCounterStun(ch)
         if CounterReturn and Combat and Combat.HitReport then
             local r = Config.hitbox.radius > 0 and Config.hitbox.radius or 7
             for _, t in ipairs(collect(r)) do
-                if dealing(t) and reportOnce(Active.Seq, t) then
+                if dealing(t) and reportOnce(currentSeq(), t) then
                     STATS.counterHits = STATS.counterHits + 1
                 end
             end
@@ -1289,10 +1328,98 @@ ApplyAllConfig = function()
     notify("Config applied")
 end
 
+-- =========================== DISCOVERY ====================================
+-- The hardcoded module paths were guesses. Scan what the game actually ships,
+-- resolve by name, and fall back to the old paths only if the scan misses.
+
+local Discovered = { modules = {}, remotes = {} }
+
+local function scanTree(root, depth)
+    if depth <= 0 then return end
+    local ok, kids = pcall(function() return root:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return end
+    for _, inst in ipairs(kids) do
+        if inst:IsA("ModuleScript") then
+            if not Discovered.modules[inst.Name] then Discovered.modules[inst.Name] = inst end
+        elseif inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent") then
+            Discovered.remotes[inst.Name] = inst
+        elseif not inst:IsA("BasePart") and not inst:IsA("LuaSourceContainer") and not inst:IsA("Camera") then
+            scanTree(inst, depth - 1)
+        end
+    end
+end
+
+local function moduleLike(name)
+    local exact = Discovered.modules[name]
+    if exact then return exact end
+    local want = string.lower(name)
+    for n, m in pairs(Discovered.modules) do
+        if string.lower(n) == want then return m end
+    end
+    return nil
+end
+
+local function remoteLike(keys)
+    for _, k in ipairs(keys) do
+        for name, r in pairs(Discovered.remotes) do
+            if string.lower(name) == string.lower(k) then return r, name end
+        end
+    end
+    for _, k in ipairs(keys) do
+        for name, r in pairs(Discovered.remotes) do
+            if string.find(string.lower(name), string.lower(k), 1, true) then return r, name end
+        end
+    end
+    return nil
+end
+
+local function resolveModule(name, path, timeout)
+    local m = moduleLike(name)
+    if m then
+        local ok, mod = pcall(require, m)
+        if ok and mod ~= nil then return mod end
+    end
+    if path then return safeRequire(path, timeout or 1.5) end
+    return nil
+end
+
+local function doctorLines()
+    local modCount, remCount = 0, 0
+    local remNames, modNames = {}, {}
+    for n in pairs(Discovered.modules) do modCount = modCount + 1; modNames[#modNames + 1] = n end
+    for n in pairs(Discovered.remotes) do remCount = remCount + 1; remNames[#remNames + 1] = n end
+    table.sort(modNames)
+    table.sort(remNames)
+
+    local L = {}
+    L[#L + 1] = string.format("modules=%d remotes=%d", modCount, remCount)
+    L[#L + 1] = string.format("Combat=%s Weave=%s HitReport=%s",
+        tostring(Combat ~= nil),
+        tostring(Combat ~= nil and Combat.Weave ~= nil),
+        tostring(Combat ~= nil and Combat.HitReport ~= nil))
+    L[#L + 1] = string.format("AttackState=%s HitWindow=%s Hitboxes=%s CharCtrl=%s DataCtrl=%s",
+        tostring(AttackState ~= nil), tostring(HitWindow ~= nil), tostring(Hitboxes ~= nil),
+        tostring(CharacterController ~= nil), tostring(DataController ~= nil))
+    L[#L + 1] = "remotes: " .. (#remNames > 0 and table.concat(remNames, ", ") or "(none)")
+    L[#L + 1] = "modules: " .. (#modNames > 0 and table.concat(modNames, ", ") or "(none)")
+    return L
+end
+
+RunDoctor = function()
+    local L = doctorLines()
+    for _, line in ipairs(L) do print("[YSL] " .. line) end
+    if hasFS() then
+        ensureFolder("YSL")
+        pcall(writefile, "YSL/doctor.txt", table.concat(L, "\n"))
+        print("[YSL] wrote YSL/doctor.txt")
+    end
+    notify("Doctor: " .. L[1] .. " | " .. L[2])
+end
+
 -- =========================== INIT ==========================================
 
 task.spawn(function()
-    task.wait(3)
+    task.wait(1.5)
     local ok, err = pcall(function()
         -- Sweep anything an earlier version of this script left behind: stray
         -- marker parts (the grey box), stale glide bodies, duplicate crosshairs.
@@ -1314,17 +1441,36 @@ task.spawn(function()
             end
         end
 
-        Remotes = safeRequire({ "Shared", "Net", "Remotes" }, 8)
+        scanTree(ReplicatedStorage, 6)
+        local rs = safeWait(ReplicatedStorage, "Shared", 1)
+        if rs then scanTree(rs, 6) end
+        print(string.format("[YSL] discovered %d modules, %d remotes",
+            (function() local n = 0 for _ in pairs(Discovered.modules) do n = n + 1 end return n end)(),
+            (function() local n = 0 for _ in pairs(Discovered.remotes) do n = n + 1 end return n end)()))
+
+        Remotes = resolveModule("Remotes", { "Shared", "Net", "Remotes" }, 2)
         if Remotes and Remotes.Client then
             local okc, c = pcall(function() return Remotes.Client("CombatService") end)
             if okc then Combat = c end
         end
-        AttackState         = safeRequire({ "Client", "Combat", "AttackState" }, 8)
-        HitWindow           = safeRequire({ "Client", "Combat", "HitWindow" }, 8)
-        Hitboxes            = safeRequire({ "Client", "Combat", "Hitboxes" }, 8)
-        CharacterController = safeRequire({ "Client", "Controllers", "CharacterController" }, 8)
-        DataController      = safeRequire({ "Client", "Controllers", "DataController" }, 8)
-        Classes             = safeRequire({ "Shared", "Config", "Classes" }, 5)
+        AttackState         = resolveModule("AttackState", { "Client", "Combat", "AttackState" }, 2)
+        HitWindow           = resolveModule("HitWindow", { "Client", "Combat", "HitWindow" }, 2)
+        Hitboxes            = resolveModule("Hitboxes", { "Client", "Combat", "Hitboxes" }, 2)
+        CharacterController = resolveModule("CharacterController", { "Client", "Controllers", "CharacterController" }, 2)
+        DataController      = resolveModule("DataController", { "Client", "Controllers", "DataController" }, 2)
+        Classes             = resolveModule("Classes", { "Shared", "Config", "Classes" }, 1.5)
+
+        -- If the service table never resolved, wire straight to the real remotes.
+        if not Combat then Combat = {} end
+        if not Combat.Weave then
+            local r = remoteLike({ "weave", "weaving" })
+            if r then Combat.Weave = r; print("[YSL] Weave -> " .. r.Name) end
+        end
+        if not Combat.HitReport then
+            local r = remoteLike({ "hitreport", "hit", "damage", "strike", "swing", "punch", "attack", "combat" })
+            if r then Combat.HitReport = r; print("[YSL] HitReport -> " .. r.Name) end
+        end
+
         if AttackState and AttackState.Active then Active = AttackState.Active end
         origHWStart = HitWindow and HitWindow.Start
         origHBStart = Hitboxes and Hitboxes.Start
@@ -1343,6 +1489,17 @@ task.spawn(function()
         end
 
         hookCombat()
+
+        if not origHWStart then
+            UserInputService.InputBegan:Connect(function(input, processed)
+                if processed then return end
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                    or input.UserInputType == Enum.UserInputType.Touch then
+                    attackTrigger()
+                end
+            end)
+            print("[YSL] no HitWindow path - input fallback active for hits")
+        end
 
         if LP.Character then
             setupCounterStun(LP.Character)
@@ -1366,6 +1523,7 @@ task.spawn(function()
         end)
 
         print("[YSL] Combat ready")
+        RunDoctor()
 
         task.wait(1)
         local autoName = nil
